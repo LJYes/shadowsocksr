@@ -123,6 +123,29 @@ RSP_STATE_ERROR = b"\x03"
 RSP_STATE_DISCONNECT = b"\x04"
 RSP_STATE_REDIRECT = b"\x05"
 
+class UDPAsyncDNSHandler(object):
+    def __init__(self, params):
+        self.params = params
+        self.remote_addr = None
+        self.call_back = None
+
+    def resolve(self, dns_resolver, remote_addr, call_back):
+        self.call_back = call_back
+        self.remote_addr = remote_addr
+        dns_resolver.resolve(remote_addr[0], self._handle_dns_resolved)
+
+    def _handle_dns_resolved(self, result, error):
+        if error:
+            logging.error("%s when resolve DNS" % (error,)) #drop
+            return
+        if result:
+            ip = result[1]
+            if ip:
+                if self.call_back:
+                    self.call_back(self.remote_addr, None, ip, True, *self.params)
+                    return
+        logging.warning("can't resolve %s" % (self.remote_addr,))
+
 def client_key(source_addr, server_af):
     # notice this is server af, not dest af
     return '%s:%s:%d' % (source_addr[0], source_addr[1], server_af)
@@ -249,9 +272,9 @@ class UDPRelay(object):
                             self.del_user(uid)
                         else:
                             passwd = items[1]
-                            self.add_user(uid, {'password':passwd})
+                            self.add_user(uid, passwd)
 
-    def _update_user(self, id, passwd):
+    def update_user(self, id, passwd):
         uid = struct.pack('<I', id)
         self.add_user(uid, passwd)
 
@@ -264,13 +287,12 @@ class UDPRelay(object):
             uid = struct.pack('<I', id)
             self.add_user(uid, users[id])
 
-    def add_user(self, uid, cfg): # user: binstr[4], passwd: str
-        passwd = cfg['password']
-        self.server_users[uid] = common.to_bytes(passwd)
+    def add_user(self, user, passwd): # user: binstr[4], passwd: str
+        self.server_users[user] = common.to_bytes(passwd)
 
-    def del_user(self, uid):
-        if uid in self.server_users:
-            del self.server_users[uid]
+    def del_user(self, user):
+        if user in self.server_users:
+            del self.server_users[user]
 
     def add_transfer_u(self, user, transfer):
         if user is None:
@@ -384,24 +406,17 @@ class UDPRelay(object):
             server_addr, server_port = dest_addr, dest_port
 
         if (addrtype & 7) == 3:
-            af = common.is_ip(server_addr)
-            if af == False:
-                handler = common.UDPAsyncDNSHandler((data, r_addr, uid, header_length))
-                handler.resolve(self._dns_resolver, (server_addr, server_port), self._handle_server_dns_resolved)
-            else:
-                self._handle_server_dns_resolved("", (server_addr, server_port), server_addr, (data, r_addr, uid, header_length))
+            handler = UDPAsyncDNSHandler((data, r_addr, uid, header_length))
+            handler.resolve(self._dns_resolver, (server_addr, server_port), self._handle_server_dns_resolved)
         else:
-            self._handle_server_dns_resolved("", (server_addr, server_port), server_addr, (data, r_addr, uid, header_length))
+            self._handle_server_dns_resolved((server_addr, server_port), None, server_addr, False, data, r_addr, uid, header_length)
 
-    def _handle_server_dns_resolved(self, error, remote_addr, server_addr, params):
-        if error:
-            return
-        data, r_addr, uid, header_length = params
-        user_id = self._listen_port
+    def _handle_server_dns_resolved(self, remote_addr, addrs, server_addr, dns_resolved, data, r_addr, uid, header_length):
         try:
             server_port = remote_addr[1]
-            addrs = socket.getaddrinfo(server_addr, server_port, 0,
-                                        socket.SOCK_DGRAM, socket.SOL_UDP)
+            if addrs is None:
+                addrs = socket.getaddrinfo(server_addr, server_port, 0,
+                                            socket.SOCK_DGRAM, socket.SOL_UDP)
             if not addrs: # drop
                 return
             af, socktype, proto, canonname, sa = addrs[0]
@@ -442,7 +457,9 @@ class UDPRelay(object):
 
                 logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
 
-                if uid is not None:
+                if uid is None:
+                    user_id = self._listen_port
+                else:
                     user_id = struct.unpack('<I', client_uid)[0]
             else:
                 client, client_uid = client_pair
@@ -629,6 +646,7 @@ class UDPRelay(object):
         if self._closed:
             self._cache.clear(0)
             self._cache_dns_client.clear(0)
+            #self._dns_cache.sweep()
             if self._eventloop:
                 self._eventloop.remove_periodic(self.handle_periodic)
                 self._eventloop.remove(self._server_socket)
@@ -640,6 +658,7 @@ class UDPRelay(object):
             before_sweep_size = len(self._sockets)
             self._cache.sweep()
             self._cache_dns_client.sweep()
+            #self._dns_cache.sweep()
             if before_sweep_size != len(self._sockets):
                 logging.debug('UDP port %5d sockets %d' % (self._listen_port, len(self._sockets)))
             self._sweep_timeout()

@@ -123,6 +123,29 @@ class SpeedTester(object):
             return self.sum_len >= self.max_speed
         return False
 
+class UDPAsyncDNSHandler(object):
+    def __init__(self, params):
+        self.params = params
+        self.remote_addr = None
+        self.call_back = None
+
+    def resolve(self, dns_resolver, remote_addr, call_back):
+        self.call_back = call_back
+        self.remote_addr = remote_addr
+        dns_resolver.resolve(remote_addr[0], self._handle_dns_resolved)
+
+    def _handle_dns_resolved(self, result, error):
+        if error:
+            logging.error("%s when resolve DNS" % (error,)) #drop
+            return
+        if result:
+            ip = result[1]
+            if ip:
+                if self.call_back:
+                    self.call_back(self.params, self.remote_addr, ip)
+                    return
+        logging.warning("can't resolve %s" % (self.remote_addr,))
+
 class TCPRelayHandler(object):
     def __init__(self, server, fd_to_handlers, loop, local_sock, config,
                  dns_resolver, is_local):
@@ -138,7 +161,6 @@ class TCPRelayHandler(object):
         self._remote_udp = False
         self._config = config
         self._dns_resolver = dns_resolver
-        self._add_ref = 0
         if not self._create_encryptor(config):
             return
 
@@ -218,7 +240,6 @@ class TCPRelayHandler(object):
         self._update_activity()
         self._server.add_connection(1)
         self._server.stat_add(self._client_address[0], 1)
-        self._add_ref = 1
         self.speed_tester_u = SpeedTester(config.get("speed_limit_per_con", 0))
         self.speed_tester_d = SpeedTester(config.get("speed_limit_per_con", 0))
         self._recv_u_max_size = BUF_SIZE
@@ -275,11 +296,6 @@ class TCPRelayHandler(object):
     def _update_user(self, user):
         self._user = user
         self._user_id = struct.unpack('<I', user)[0]
-        if self._user in self._server.server_users_cfg:
-            cfg = self._server.server_users_cfg[self._user]
-            speed = cfg.get('speed_limit_per_con', 0)
-            self.speed_tester_u.update_limit(speed)
-            self.speed_tester_d.update_limit(speed)
 
     def _update_activity(self, data_len=0):
         # tell the TCP Relay we have activities recently
@@ -331,11 +347,15 @@ class TCPRelayHandler(object):
                 #logging.info('UDP over TCP sendto %d %s' % (len(data), binascii.hexlify(data)))
                 while len(self._udp_data_send_buffer) > 6:
                     length = struct.unpack('>H', self._udp_data_send_buffer[:2])[0]
+                    if length >= 0xff00:
+                        length = struct.unpack('>H', self._udp_data_send_buffer[1:3])[0] + 0xff00
 
                     if length > len(self._udp_data_send_buffer):
                         break
 
                     data = self._udp_data_send_buffer[:length]
+                    if length >= 0xff00:
+                        data = data[1:]
                     self._udp_data_send_buffer = self._udp_data_send_buffer[length:]
 
                     frag = common.ord(data[2])
@@ -349,14 +369,10 @@ class TCPRelayHandler(object):
                         continue
                     connecttype, addrtype, dest_addr, dest_port, header_length = header_result
                     if (addrtype & 7) == 3:
-                        af = common.is_ip(dest_addr)
-                        if af == False:
-                            handler = common.UDPAsyncDNSHandler(data[header_length:])
-                            handler.resolve(self._dns_resolver, (dest_addr, dest_port), self._handle_server_dns_resolved)
-                        else:
-                            return self._handle_server_dns_resolved("", (dest_addr, dest_port), dest_addr, data[header_length:])
+                        handler = UDPAsyncDNSHandler(data[header_length:])
+                        handler.resolve(self._dns_resolver, (dest_addr, dest_port), self._handle_server_dns_resolved)
                     else:
-                        return self._handle_server_dns_resolved("", (dest_addr, dest_port), dest_addr, data[header_length:])
+                        return self._handle_server_dns_resolved(data[header_length:], (dest_addr, dest_port), dest_addr)
 
             except Exception as e:
                 #trace = traceback.format_exc()
@@ -419,9 +435,7 @@ class TCPRelayHandler(object):
                 logging.error('write_all_to_sock:unknown socket from %s:%d' % (self._client_address[0], self._client_address[1]))
         return True
 
-    def _handle_server_dns_resolved(self, error, remote_addr, server_addr, data):
-        if error:
-            return
+    def _handle_server_dns_resolved(self, data, remote_addr, server_addr):
         try:
             addrs = socket.getaddrinfo(server_addr, remote_addr[1], 0, socket.SOCK_DGRAM, socket.SOL_UDP)
             if not addrs: # drop
@@ -816,17 +830,17 @@ class TCPRelayHandler(object):
         if self._overhead == 0:
             return recv_buffer_size
         buffer_size = len(sock.recv(recv_buffer_size, socket.MSG_PEEK))
-        frame_size = self._tcp_mss - self._overhead
         if up:
             buffer_size = min(buffer_size, self._recv_u_max_size)
-            self._recv_u_max_size = min(self._recv_u_max_size + frame_size, BUF_SIZE)
+            self._recv_u_max_size = min(self._recv_u_max_size + TCP_MSS, BUF_SIZE)
         else:
             buffer_size = min(buffer_size, self._recv_d_max_size)
-            self._recv_d_max_size = min(self._recv_d_max_size + frame_size, BUF_SIZE)
+            self._recv_d_max_size = min(self._recv_d_max_size + TCP_MSS, BUF_SIZE)
         if buffer_size == recv_buffer_size:
             return buffer_size
-        if buffer_size > frame_size:
-            buffer_size = int(buffer_size / frame_size) * frame_size
+        s = buffer_size % self._tcp_mss + self._overhead
+        if s > self._tcp_mss:
+            return buffer_size - (s - self._tcp_mss)
         return buffer_size
 
     def _on_local_read(self):
@@ -858,10 +872,6 @@ class TCPRelayHandler(object):
                 if self._encrypt_correct:
                     try:
                         obfs_decode = self._obfs.server_decode(data)
-                        if self._stage == STAGE_INIT:
-                            self._overhead = self._obfs.get_overhead(self._is_local) + self._protocol.get_overhead(self._is_local)
-                            server_info = self._protocol.get_server_info()
-                            server_info.overhead = self._overhead
                     except Exception as e:
                         shell.print_exception(e)
                         logging.error("exception from %s:%d" % (self._client_address[0], self._client_address[1]))
@@ -943,7 +953,10 @@ class TCPRelayHandler(object):
                     ip = socket.inet_pton(socket.AF_INET6, addr[0])
                     data = b'\x00\x04' + ip + port + data
                 size = len(data) + 2
-                data = struct.pack('>H', size) + data
+                if size >= 0xff00:
+                    data = common.chr(0xff) + struct.pack('>H', size - 0xff00 + 1) + data
+                else:
+                    data = struct.pack('>H', size) + data
                 #logging.info('UDP over TCP recvfrom %s:%d %d bytes to %s:%d' % (addr[0], addr[1], len(data), self._client_address[0], self._client_address[1]))
             else:
                 if self._is_local:
@@ -1061,7 +1074,7 @@ class TCPRelayHandler(object):
                     handle = True
                     self._on_remote_read(sock == self._remote_sock)
                 else:
-                    self._recv_d_max_size = self._tcp_mss - self._overhead
+                    self._recv_d_max_size = TCP_MSS
             elif event & eventloop.POLL_OUT:
                 handle = True
                 self._on_remote_write()
@@ -1074,7 +1087,7 @@ class TCPRelayHandler(object):
                     handle = True
                     self._on_local_read()
                 else:
-                    self._recv_u_max_size = self._tcp_mss - self._overhead
+                    self._recv_u_max_size = TCP_MSS
             elif event & eventloop.POLL_OUT:
                 handle = True
                 self._on_local_write()
@@ -1165,9 +1178,8 @@ class TCPRelayHandler(object):
         self._encryptor = None
         self._dns_resolver.remove_callback(self._handle_dns_resolved)
         self._server.remove_handler(self)
-        if self._add_ref > 0:
-            self._server.add_connection(-1)
-            self._server.stat_add(self._client_address[0], -1)
+        self._server.add_connection(-1)
+        self._server.stat_add(self._client_address[0], -1)
 
 class TCPRelay(object):
     def __init__(self, config, dns_resolver, is_local, stat_callback=None, stat_counter=None):
@@ -1180,7 +1192,6 @@ class TCPRelay(object):
         self.server_transfer_ul = 0
         self.server_transfer_dl = 0
         self.server_users = {}
-        self.server_users_cfg = {}
         self.server_user_transfer_ul = {}
         self.server_user_transfer_dl = {}
         self.mu = False
@@ -1271,9 +1282,9 @@ class TCPRelay(object):
                             self.del_user(uid)
                         else:
                             passwd = items[1]
-                            self.add_user(uid, {'password':passwd})
+                            self.add_user(uid, passwd)
 
-    def _update_user(self, id, passwd):
+    def update_user(self, id, passwd):
         uid = struct.pack('<I', id)
         self.add_user(uid, passwd)
 
@@ -1286,25 +1297,12 @@ class TCPRelay(object):
             uid = struct.pack('<I', id)
             self.add_user(uid, users[id])
 
-    def add_user(self, uid, cfg): # user: binstr[4], passwd: str
-        passwd = cfg['password']
-        self.server_users[uid] = common.to_bytes(passwd)
-        self.server_users_cfg[uid] = cfg
-        speed = cfg.get("speed_limit_per_user", 0)
-        if uid in self._speed_tester_u:
-            self._speed_tester_u[uid].update_limit(speed)
-        else:
-            self._speed_tester_u[uid] = SpeedTester(speed)
-        if uid in self._speed_tester_d:
-            self._speed_tester_d[uid].update_limit(speed)
-        else:
-            self._speed_tester_d[uid] = SpeedTester(speed)
+    def add_user(self, user, passwd): # user: binstr[4], passwd: str
+        self.server_users[user] = common.to_bytes(passwd)
 
-    def del_user(self, uid):
-        if uid in self.server_users:
-            del self.server_users[uid]
-        if uid in self.server_users_cfg:
-            del self.server_users_cfg[uid]
+    def del_user(self, user):
+        if user in self.server_users:
+            del self.server_users[user]
 
     def add_transfer_u(self, user, transfer):
         if user is None:

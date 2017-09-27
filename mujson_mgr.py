@@ -214,11 +214,11 @@ def print_server_help():
 	print('''usage: python mujson_manage.py -a|-d|-e|-c|-l [OPTION]...
 
 Actions:
-  -a                   add/edit a user
-  -d                   delete a user
-  -e                   edit a user
-  -c                   set u&d to zero
-  -l                   display a user infomation or all users infomation
+  -a ADD               add/edit a user
+  -d DELETE            delete a user
+  -e EDIT              edit a user
+  -c CLEAR             set u/d to zero
+  -l LIST              display a user infomation or all users infomation
 
 Options:
   -u USER              the user name
@@ -232,8 +232,6 @@ Options:
   -t TRANSFER          max transfer for G bytes, default: 8388608 (8 PB or 8192 TB)
   -f FORBID            set forbidden ports. Example (ban 1~79 and 81~100): -f "1-79,81-100"
   -i MUID              set sub id to display (only work with -l)
-  -s SPEED             set speed_limit_per_con
-  -S SPEED             set speed_limit_per_user
 
 General options:
   -h, --help           show this help message and exit
@@ -241,7 +239,7 @@ General options:
 
 
 def main():
-	shortopts = 'adeclu:i:p:k:O:o:G:g:m:t:f:hs:S:'
+	shortopts = 'adeclu:i:p:k:O:o:G:g:m:t:f:h'
 	longopts = ['help']
 	action = None
 	user = {}
@@ -304,10 +302,6 @@ def main():
 				user['obfs_param'] = value
 			elif key == '-G':
 				user['protocol_param'] = value
-			elif key == '-s':
-				user['speed_limit_per_con'] = int(value)
-			elif key == '-S':
-				user['speed_limit_per_user'] = int(value)
 			elif key == '-m':
 				if value in fast_set_method:
 					user['method'] = fast_set_method[value]

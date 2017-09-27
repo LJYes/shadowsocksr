@@ -29,6 +29,7 @@ if __name__ == '__main__':
 
 try:
     from collections import OrderedDict
+    print("loaded collections.OrderedDict")
 except:
     from shadowsocks.ordereddict import OrderedDict
 
